@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+original_dataleak/results/
+no_dataleak/results/
+combined_results/
+
+.DS_Store
+Thumbs.db
