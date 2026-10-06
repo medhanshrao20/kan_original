@@ -1,59 +1,94 @@
-# KANInformer Decomposition Leakage Comparison
+# KANInformer Reproduction Study
 
-This repository contains two independent experiment folders for comparing the same paper-replica KANInformer pipeline under one controlled difference:
+Two independent experiment folders implement the published core methods and an
+operationally causal adaptation. The former Transformer/RBF approximation has been
+replaced with Informer attention, distillation, an encoder/decoder, pykan B-splines,
+VMD and empirical Meyer-wavelet EWT.
 
-```text
-VMD-CA-EWT decomposition before train/test split
-vs
-VMD-CA-EWT decomposition after train/test split
-```
+Exact numerical replication is **not established**. Read either folder's
+`REPRODUCTION_AUDIT.md` for verified paper settings, conflicts with public source,
+unpublished settings, incomplete dataset coverage, and experiments still absent.
+The supplied autumn CSV does not cover November in full.
 
-## Folder Structure
+## Installation
 
-```text
-original_dataleak/
-no_dataleak/
-results.py
-```
-
-## 1. Original Data-Leak Paper Replica
-
-This follows the suspected leakage order where VMD-CA-EWT decomposition is applied to the full seasonal wind-speed sequence before chronological splitting.
+Use Python 3.10 or 3.11. Each folder includes its own data and requirements.
+From the repository root on Windows PowerShell:
 
 ```powershell
-cd original_dataleak
-pip install -r requirements.txt
-python run.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r original_dataleak/requirements.txt
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
 
-## 2. No-Data-Leak Paper Replica
+On Linux, activate with `source .venv/bin/activate` instead. Install a CUDA-enabled
+PyTorch build appropriate for the destination machine using the selector at
+https://pytorch.org/get-started/locally/. A working NVIDIA driver and CUDA-enabled
+PyTorch are needed; installing requirements alone does not guarantee GPU support.
+The entry point automatically selects CUDA when available.
 
-This follows the same paper-replica architecture, but performs chronological splitting before VMD-CA-EWT decomposition.
-
-```powershell
-cd ..\no_dataleak
-pip install -r requirements.txt
-python run.py
-```
-
-## 3. Combined Comparison
-
-After running both folders:
+## Run Separately
 
 ```powershell
-cd ..
+python original_dataleak/run.py
+python no_dataleak/run.py
 python results.py
 ```
 
-Combined outputs are written to:
+Alternatively, enter either folder and run `python run.py`. Paths are resolved from
+the script location and contain no fixed drive/user directories. `--data` and
+`--output` accept custom paths.
 
-```text
-combined_results/
+Each normal run first performs a reduced smoke run, removes its own smoke outputs,
+then runs full training. `--smoke-only` stops after that check. `--skip-smoke` skips it.
+Progress is printed during decomposition and training. Existing full results are
+overwritten; use a different `--output` directory to preserve them.
+
+`original_dataleak` decomposes the full seasonal signal before splitting. It also
+uses full-season preprocessing/PCC. `no_dataleak` fits preprocessing/PCC/scaling
+on training data and decomposes observed histories ending at each forecast origin.
+The comparison therefore changes more than decomposition timing. Results do not
+prove which operation caused a score difference.
+
+## Paper and Source Modes
+
+```powershell
+python original_dataleak/run.py --architecture paper --feature-selection paper
+python original_dataleak/run.py --architecture author --e-layers 1 --scaler-scope full
 ```
 
-Each experiment also writes its own outputs to:
+The default `paper` mode follows the written architecture and Table 6: two encoder
+layers, one decoder layer, B-spline KAN in each attention block, distillation and
+zero-padded generative decoding. `author` mode follows the public source's flattened
+KAN and recursive next-feature prediction, with runtime defects repaired.
+These are explicit alternatives because the source and paper conflict.
+`--feature-selection paper` uses the reported seasonal variable lists; the default
+computes PCC and records whether the selected variables match the paper.
 
-```text
-original_dataleak/results/
-no_dataleak/results/
+`--require-paper-data` rejects incomplete seasonal coverage. It will reject the
+supplied autumn data and the missing first winter midnight; it does not invent rows.
+
+## Checks and Outputs
+
+```powershell
+python original_dataleak/checks.py
+python no_dataleak/checks.py
 ```
+
+Checks cover full-size forward/backward passes, author recursive forecasts, attention
+equations, EWT reconstruction, odd-length alignment, split boundaries and future-data
+independence. CPU verification does not constitute verification on every GPU.
+
+Each folder writes `results/metrics.csv`, predictions per horizon, best-validation
+checkpoints, training losses, PCC reports and `summary.json` containing settings,
+dataset hash and coverage. `results.py` creates comparison CSV/Markdown/JSON under
+`combined_results/` and rejects mismatched datasets, smoke runs and mismatched seasons.
+Published values come from Table 9 and are never substituted for computed results.
+
+Rolling VMD/EWT is CPU preprocessing and can take substantial time even when neural
+training uses CUDA. `--decomposition-context 256` limits observed history to accelerate
+the causal run, but changes the experiment and is recorded in its configuration.
+
+The baselines, all ablations, external hybrid models, full hyperparameter search and
+SHAP figures from the paper are not regenerated by these entry points. See the audit.

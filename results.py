@@ -43,12 +43,32 @@ def main() -> None:
     original = load_metrics(ORIGINAL, "original_dataleak").copy()
     no_leak = load_metrics(NO_LEAK, "no_dataleak").copy()
 
+    metadata = []
+    for path in [ORIGINAL, NO_LEAK]:
+        summary_path = path.parent / "summary.json"
+        if not summary_path.exists():
+            raise ValueError(f"Missing provenance: {summary_path}; rerun the corrected entry point.")
+        metadata.append(json.loads(summary_path.read_text(encoding="utf-8")))
+    if any(item.get("config", {}).get("smoke", False) for item in metadata):
+        raise ValueError("Smoke metrics cannot be combined as final experimental results.")
+    if metadata[0].get("dataset_sha256") != metadata[1].get("dataset_sha256"):
+        raise ValueError("The two runs used different raw datasets.")
+    differences = {key: [metadata[0]["config"].get(key), metadata[1]["config"].get(key)]
+                   for key in metadata[0]["config"]
+                   if metadata[0]["config"].get(key) != metadata[1]["config"].get(key)}
+    print("Comparison includes differences in cleaning/PCC scope and causal decomposition; it does not isolate a single cause.")
+    if differences:
+        print(f"Additional configuration differences: {differences}")
+
     original = original.rename(columns={"rmse": "original_dataleak_rmse", "mae": "original_dataleak_mae", "mape": "original_dataleak_mape"})
     no_leak = no_leak.rename(columns={"rmse": "no_dataleak_rmse", "mae": "no_dataleak_mae", "mape": "no_dataleak_mape"})
 
     cols_original = ["season", "horizon", "original_dataleak_rmse", "original_dataleak_mae", "original_dataleak_mape"]
     cols_no_leak = ["season", "horizon", "no_dataleak_rmse", "no_dataleak_mae", "no_dataleak_mape"]
-    merged = original[cols_original].merge(no_leak[cols_no_leak], on=["season", "horizon"], how="outer")
+    merged = original[cols_original].merge(no_leak[cols_no_leak], on=["season", "horizon"], how="outer", validate="one_to_one", indicator=True)
+    if not merged["_merge"].eq("both").all():
+        raise ValueError("Season/horizon coverage differs between runs; rerun matching seasons.")
+    merged = merged.drop(columns="_merge")
 
     for metric in ["rmse", "mae", "mape"]:
         merged[f"paper_{metric}"] = [PAPER_FINAL[(s, int(h))][metric] for s, h in zip(merged["season"], merged["horizon"])]
@@ -62,7 +82,9 @@ def main() -> None:
         "original_dataleak_metrics": str(ORIGINAL),
         "no_dataleak_metrics": str(NO_LEAK),
         "comparison_csv": str(OUT_DIR / "dataleak_vs_no_dataleak_comparison.csv"),
-        "interpretation": "Lower RMSE/MAE/MAPE is better. If original_dataleak is much closer to paper values than no_dataleak, that supports the user's leakage hypothesis.",
+        "configuration_differences": differences,
+        "exact_replication": False,
+        "interpretation": "Lower errors indicate better scores on each run's evaluation data. Cleaning/PCC/decomposition protocols differ; closeness to paper scores does not prove leakage caused those scores. Dataset coverage and cleaned targets must also be checked.",
     }
     (OUT_DIR / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 

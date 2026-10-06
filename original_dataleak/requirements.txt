@@ -1,5 +1,12 @@
-numpy
-pandas
-scipy
-scikit-learn
-torch
+numpy>=1.24,<2
+pandas>=2,<3
+scipy>=1.10,<2
+scikit-learn>=1.2,<2
+torch>=2.0
+pykan==0.2.8
+vmdpy==0.2
+ewtpy==0.2
+PyYAML
+matplotlib
+sympy
+tqdm
