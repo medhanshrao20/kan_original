@@ -1,14 +1,24 @@
-# No-Data-Leak Pipeline
+# No-Data-Leak Paper Replica
 
-This folder follows the same core paper architecture but makes it chronologically leakage-safe:
+This folder implements the same paper-described KANInformer pipeline, but moves the suspected leakage step after the chronological split:
 
-1. split each season into train/validation/test first,
-2. fit cleaning statistics on train only,
-3. select features using train only,
-4. fit scaling on train only,
-5. train on train, tune/check validation, and evaluate once on test.
+```text
+raw hourly data
+-> paper preprocessing
+-> season split
+-> PCC report / paper seasonal inputs
+-> chronological train/validation/test split
+-> VMD-CA-EWT decomposition separately on train, validation, and test
+-> train-only MinMax scaling
+-> KANInformer-style model
+-> h1/h2/h3 RMSE, MAE, MAPE
+```
 
-The decomposition is also isolated by split so training features are not built from validation/test wind-speed values.
+The intended controlled difference from `original_dataleak` is:
+
+```text
+VMD-CA-EWT decomposition is done after train/test splitting.
+```
 
 Run:
 
@@ -16,10 +26,10 @@ Run:
 python run.py
 ```
 
-Fast smoke test only:
+Fast smoke test:
 
 ```powershell
 python run.py --smoke-only
 ```
 
-Outputs are written to `results/`.
+Results are written to `results/`.

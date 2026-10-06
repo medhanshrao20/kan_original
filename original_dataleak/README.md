@@ -1,15 +1,24 @@
-# Original Data-Leak Pipeline
+# Original Data-Leak Paper Replica
 
-This folder intentionally follows the paper-style order:
+This folder implements the paper-described KANInformer pipeline with the main suspected leakage condition:
 
-1. clean the full seasonal data,
-2. select features on the full season,
-3. decompose the full season using VMD-CA-EWT-style features,
-4. scale the full season,
-5. split into train/validation/test,
-6. train the KANInformer-style model.
+```text
+raw hourly data
+-> paper preprocessing
+-> season split
+-> PCC report / paper seasonal inputs
+-> VMD-CA-EWT decomposition on the full season
+-> chronological train/validation/test split
+-> train-only MinMax scaling
+-> KANInformer-style model
+-> h1/h2/h3 RMSE, MAE, MAPE
+```
 
-That means this pipeline is intentionally data-leaky. It is useful for testing the hypothesis that a paper-style full-series preprocessing flow can produce better-looking results.
+The intended leakage variable is:
+
+```text
+VMD-CA-EWT decomposition is done before train/test splitting.
+```
 
 Run:
 
@@ -17,10 +26,10 @@ Run:
 python run.py
 ```
 
-Fast smoke test only:
+Fast smoke test:
 
 ```powershell
 python run.py --smoke-only
 ```
 
-Outputs are written to `results/`.
+Results are written to `results/`.

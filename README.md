@@ -1,6 +1,12 @@
-# KANInformer Leakage Comparison
+# KANInformer Decomposition Leakage Comparison
 
-This repository contains two independent experiment folders for comparing a paper-style data-leaky pipeline against a chronological no-data-leak pipeline.
+This repository contains two independent experiment folders for comparing the same paper-replica KANInformer pipeline under one controlled difference:
+
+```text
+VMD-CA-EWT decomposition before train/test split
+vs
+VMD-CA-EWT decomposition after train/test split
+```
 
 ## Folder Structure
 
@@ -10,9 +16,9 @@ no_dataleak/
 results.py
 ```
 
-## 1. Original Data-Leak Pipeline
+## 1. Original Data-Leak Paper Replica
 
-This follows the paper-style order where full-season cleaning, feature selection, decomposition, and scaling happen before the train/validation/test split.
+This follows the suspected leakage order where VMD-CA-EWT decomposition is applied to the full seasonal wind-speed sequence before chronological splitting.
 
 ```powershell
 cd original_dataleak
@@ -20,9 +26,9 @@ pip install -r requirements.txt
 python run.py
 ```
 
-## 2. No-Data-Leak Pipeline
+## 2. No-Data-Leak Paper Replica
 
-This follows the same core architecture, but splits chronologically first and fits preprocessing decisions using only the training part.
+This follows the same paper-replica architecture, but performs chronological splitting before VMD-CA-EWT decomposition.
 
 ```powershell
 cd ..\no_dataleak

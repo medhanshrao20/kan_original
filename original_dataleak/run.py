@@ -4,9 +4,9 @@ import argparse
 import json
 import math
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,12 +19,17 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+PIPELINE_NAME = "original_dataleak"
+DECOMPOSE_BEFORE_SPLIT = True
+
 ROOT = Path(__file__).resolve().parent
 RAW_CSV = ROOT / "data" / "raw" / "hourly.csv"
 RESULTS_DIR = ROOT / "results"
+
 SEASONS = ["winter", "spring", "summer", "autumn"]
 VARIABLES = ["ET", "PCP", "SR", "VP", "AT", "RH", "DPT", "WS", "WD", "ST"]
 METEO_VARIABLES = ["ET", "PCP", "SR", "VP", "AT", "RH", "DPT", "WD", "ST"]
+
 PAPER_SELECTED_INPUTS = {
     "spring": ["WS", "ET"],
     "summer": ["WS", "ET", "AT", "RH"],
@@ -55,12 +60,14 @@ class RunConfig:
     lr: float
     d_model: int
     n_heads: int
-    n_layers: int
+    e_layers: int
+    d_ff: int
     kan_grid: int
     window: int
     horizons: int
     vmd_iter: int
     ewt_modes: int
+    se_threshold: float
     smoke: bool
 
 
@@ -68,6 +75,8 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 def make_timestamp(date_series: pd.Series, hour_series: pd.Series) -> pd.Series:
@@ -98,23 +107,27 @@ def load_hourly(path: Path) -> pd.DataFrame:
     return frame.sort_values("timestamp").reset_index(drop=True)
 
 
-def clean_full_series_leaky(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    print("Cleaning full dataset before split [LEAKY paper-style].")
-    out = df.copy()
+def clean_like_paper(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    print("Paper preprocessing: 3-sigma outlier removal + cubic spline interpolation.")
+    cleaned = df.copy()
     counts: Dict[str, int] = {}
     for col in VARIABLES:
-        x = out[col].astype(float)
+        x = cleaned[col].astype(float)
         std = x.std(skipna=True)
         if not np.isfinite(std) or std == 0:
             counts[col] = 0
             continue
         mask = (x - x.mean(skipna=True)).abs() > 3.0 * std
         counts[col] = int(mask.sum())
-        out.loc[mask, col] = np.nan
-    out = out.set_index("timestamp")
+        cleaned.loc[mask, col] = np.nan
+
+    cleaned = cleaned.set_index("timestamp")
     for col in VARIABLES:
-        out[col] = out[col].interpolate(method="spline", order=3).ffill().bfill()
-    return out.reset_index(), counts
+        try:
+            cleaned[col] = cleaned[col].interpolate(method="spline", order=3).ffill().bfill()
+        except Exception:
+            cleaned[col] = cleaned[col].interpolate(method="linear").ffill().bfill()
+    return cleaned.reset_index(), counts
 
 
 def split_seasons(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -125,14 +138,25 @@ def split_seasons(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         "summer": (ts >= "2021-06-01") & (ts < "2021-09-01"),
         "autumn": (ts >= "2021-09-01") & (ts < "2021-12-01"),
     }
-    return {name: df.loc[mask].reset_index(drop=True) for name, mask in masks.items()}
+    return {season: df.loc[mask].reset_index(drop=True) for season, mask in masks.items()}
 
 
-def pcc_report_full_season_leaky(season_df: pd.DataFrame) -> pd.DataFrame:
-    ws = season_df["WS"].to_numpy(float)
+def chronological_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    n = len(df)
+    train_end = int(n * 0.8)
+    val_end = int(n * 0.9)
+    return (
+        df.iloc[:train_end].reset_index(drop=True),
+        df.iloc[train_end:val_end].reset_index(drop=True),
+        df.iloc[val_end:].reset_index(drop=True),
+    )
+
+
+def pcc_report(df: pd.DataFrame) -> pd.DataFrame:
+    ws = df["WS"].to_numpy(float)
     rows = []
     for col in METEO_VARIABLES:
-        x = season_df[col].to_numpy(float)
+        x = df[col].to_numpy(float)
         if np.nanstd(x) == 0 or np.nanstd(ws) == 0:
             corr, p_value = np.nan, np.nan
         else:
@@ -148,7 +172,7 @@ def pcc_report_full_season_leaky(season_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def vmd(signal: np.ndarray, k_modes: int, alpha: float = 2000.0, tol: float = 1e-6, max_iter: int = 200) -> np.ndarray:
+def vmd(signal: np.ndarray, k_modes: int, alpha: float = 2000.0, tau: float = 0.0, tol: float = 1e-7, max_iter: int = 200) -> np.ndarray:
     x = np.asarray(signal, dtype=float)
     original_len = len(x)
     if original_len % 2:
@@ -179,14 +203,14 @@ def vmd(signal: np.ndarray, k_modes: int, alpha: float = 2000.0, tol: float = 1e
             denom = np.sum(np.abs(u_hat[n + 1, positive, mode]) ** 2)
             if denom > 0:
                 omega[n + 1, mode] = np.sum(freqs[positive] * np.abs(u_hat[n + 1, positive, mode]) ** 2) / denom
-        lambda_hat[n + 1] = lambda_hat[n]
+        lambda_hat[n + 1] = lambda_hat[n] + tau * (np.sum(u_hat[n + 1], axis=1) - f_hat_plus)
         n += 1
-        diffs = u_hat[n, :, :] - u_hat[n - 1, :, :]
-        u_diff = abs(np.sum(np.conj(diffs) * diffs) / len(freqs))
+        diff = u_hat[n, :, :] - u_hat[n - 1, :, :]
+        u_diff = abs(np.sum(np.conj(diff) * diff) / len(freqs))
     full_hat = np.zeros((len(freqs), k_modes), dtype=complex)
     full_hat[len(freqs) // 2 :] = u_hat[n, len(freqs) // 2 :]
     full_hat[: len(freqs) // 2] = np.conj(np.flipud(u_hat[n, len(freqs) // 2 :]))
-    modes = np.vstack([np.real(np.fft.ifft(np.fft.ifftshift(full_hat[:, m]))) for m in range(k_modes)])
+    modes = np.vstack([np.real(np.fft.ifft(np.fft.ifftshift(full_hat[:, mode]))) for mode in range(k_modes)])
     return modes[:, half : half + original_len]
 
 
@@ -212,127 +236,154 @@ def sample_entropy(signal: np.ndarray, m: int = 2, r_ratio: float = 0.2) -> floa
 def ewt_style(signal: np.ndarray, n_modes: int) -> np.ndarray:
     x = np.asarray(signal, dtype=float)
     spectrum = np.fft.rfft(x)
-    mag = np.abs(spectrum)
-    peaks, _ = find_peaks(mag)
+    magnitude = np.abs(spectrum)
+    peaks, _ = find_peaks(magnitude)
     if len(peaks) >= n_modes:
-        strong = sorted(peaks[np.argsort(mag[peaks])[-n_modes:]])
-        boundaries = [int(round((a + b) / 2)) for a, b in zip(strong[:-1], strong[1:])]
+        strongest = sorted(peaks[np.argsort(magnitude[peaks])[-n_modes:]])
+        boundaries = [int(round((a + b) / 2)) for a, b in zip(strongest[:-1], strongest[1:])]
     else:
-        boundaries = np.linspace(1, len(mag) - 1, n_modes + 1, dtype=int)[1:-1].tolist()
-    edges = [0] + sorted(set(boundaries)) + [len(mag)]
+        boundaries = np.linspace(1, len(magnitude) - 1, n_modes + 1, dtype=int)[1:-1].tolist()
+    edges = [0] + sorted(set(boundaries)) + [len(magnitude)]
     while len(edges) < n_modes + 1:
-        edges = sorted(set(edges + np.linspace(0, len(mag), n_modes + 1, dtype=int).tolist()))
-    edges = edges[:n_modes] + [len(mag)]
-    bands = []
+        edges = sorted(set(edges + np.linspace(0, len(magnitude), n_modes + 1, dtype=int).tolist()))
+    edges = edges[:n_modes] + [len(magnitude)]
+    parts = []
     for start, end in zip(edges[:-1], edges[1:]):
         band = np.zeros_like(spectrum)
         band[start:end] = spectrum[start:end]
-        bands.append(np.fft.irfft(band, n=len(x)))
-    return np.vstack(bands)
+        parts.append(np.fft.irfft(band, n=len(x)))
+    return np.vstack(parts)
 
 
-def build_full_season_features_leaky(season: str, season_df: pd.DataFrame, config: RunConfig) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    k_modes = min(3, PAPER_VMD_K[season]) if config.smoke else PAPER_VMD_K[season]
-    ewt_modes = min(3, config.ewt_modes) if config.smoke else config.ewt_modes
-    selected = PAPER_SELECTED_INPUTS[season]
-    print(f"  {season}: building full-season VMD-CA-EWT features [LEAKY], K={k_modes}, EWT={ewt_modes}")
-    ws = season_df["WS"].to_numpy(float)
-    modes = vmd(ws, k_modes=k_modes, max_iter=config.vmd_iter)
-    se = {f"IMF{i + 1}": sample_entropy(modes[i]) for i in range(k_modes)}
-    threshold = 0.4
-    high = [i for i, name in enumerate(se) if se[name] > threshold]
-    if not high:
-        high = [int(np.argmax([se[f"IMF{i + 1}"] for i in range(k_modes)]))]
-    fused = modes[high].sum(axis=0)
-    ewts = ewt_style(fused, ewt_modes)
-    features = pd.DataFrame(index=season_df.index)
-    for col in selected:
+def fit_vmd_ca_ewt(
+    ws: np.ndarray,
+    k_modes: int,
+    ewt_modes: int,
+    se_threshold: float,
+    max_iter: int,
+    fixed_high_idx: List[int] | None = None,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    imfs = vmd(ws, k_modes=k_modes, max_iter=max_iter)
+    entropy = {f"IMF{i + 1}": sample_entropy(imfs[i]) for i in range(k_modes)}
+    if fixed_high_idx is None:
+        high_idx = [i for i in range(k_modes) if entropy[f"IMF{i + 1}"] > se_threshold]
+        if not high_idx:
+            high_idx = [int(np.argmax([entropy[f"IMF{i + 1}"] for i in range(k_modes)]))]
+    else:
+        high_idx = fixed_high_idx
+    low_idx = [i for i in range(k_modes) if i not in high_idx]
+    high_sum = imfs[high_idx].sum(axis=0)
+    ewt_parts = ewt_style(high_sum, ewt_modes)
+    report = {
+        "k_modes": k_modes,
+        "sample_entropy": entropy,
+        "high_complexity_indices_zero_based": high_idx,
+        "high_complexity_imfs": [f"IMF{i + 1}" for i in high_idx],
+        "retained_low_complexity_imfs": [f"IMF{i + 1}" for i in low_idx],
+        "ewt_modes": ewt_modes,
+    }
+    return np.vstack([imfs[low_idx], ewt_parts]) if low_idx else ewt_parts, report
+
+
+def build_feature_frame(
+    season_df: pd.DataFrame,
+    selected_inputs: Sequence[str],
+    decomp_components: np.ndarray,
+) -> pd.DataFrame:
+    frame = pd.DataFrame(index=season_df.index)
+    for col in selected_inputs:
         if col != "WS":
-            features[col] = season_df[col].to_numpy(float)
-    for i in range(k_modes):
-        features[f"IMF{i + 1}"] = modes[i]
-    for i in range(ewt_modes):
-        features[f"EWT{i + 1}"] = ewts[i]
-    features["WS"] = season_df["WS"].to_numpy(float)
-    report = {"selected_inputs": selected, "sample_entropy": se, "high_se_imfs": [f"IMF{i + 1}" for i in high], "columns": list(features.columns)}
-    return features, report
+            frame[col] = season_df[col].to_numpy(float)
+    for i in range(decomp_components.shape[0]):
+        frame[f"DECOMP{i + 1}"] = decomp_components[i]
+    frame["WS"] = season_df["WS"].to_numpy(float)
+    return frame
 
 
 class KANHead(nn.Module):
-    def __init__(self, in_features: int, out_features: int, grid: int = 8):
+    def __init__(self, in_features: int, out_features: int, grid: int):
         super().__init__()
-        self.base = nn.Linear(in_features, out_features)
+        self.linear = nn.Linear(in_features, out_features)
         self.register_buffer("centers", torch.linspace(-1.0, 1.0, grid))
         self.log_width = nn.Parameter(torch.tensor(0.0))
         self.weights = nn.Parameter(torch.randn(in_features, grid, out_features) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         basis = torch.exp(-((x.unsqueeze(-1) - self.centers) ** 2) * torch.exp(self.log_width))
-        return self.base(x) + torch.einsum("big,igo->bo", basis, self.weights)
+        return self.linear(x) + torch.einsum("big,igo->bo", basis, self.weights)
 
 
-class KANInformerLite(nn.Module):
-    def __init__(self, n_features: int, horizons: int, d_model: int, n_heads: int, n_layers: int, kan_grid: int):
+class PaperKANInformer(nn.Module):
+    def __init__(self, n_features: int, horizons: int, config: RunConfig):
         super().__init__()
-        self.embedding = nn.Linear(n_features, d_model)
+        self.embedding = nn.Linear(n_features, config.d_model)
         layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
+            d_model=config.d_model,
+            nhead=config.n_heads,
+            dim_feedforward=config.d_ff,
             dropout=0.1,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.head = KANHead(d_model, horizons, grid=kan_grid)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=config.e_layers)
+        self.kan_projection = KANHead(config.d_model, horizons, config.kan_grid)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.embedding(x)
         z = self.encoder(z)
-        return self.head(z[:, -1])
+        return self.kan_projection(z[:, -1])
 
 
-def make_windows_leaky_scaled_first(features: pd.DataFrame, config: RunConfig):
-    values = features.to_numpy(float)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(values)
-    target_idx = scaled.shape[1] - 1
+def make_windows(scaled_values: np.ndarray, window: int, horizons: int) -> Tuple[np.ndarray, np.ndarray]:
+    target_idx = scaled_values.shape[1] - 1
     xs, ys = [], []
-    for i in range(config.window, len(scaled) - config.horizons + 1):
-        xs.append(scaled[i - config.window : i])
-        ys.append([scaled[i + h, target_idx] for h in range(config.horizons)])
-    xs = np.asarray(xs, dtype=np.float32)
-    ys = np.asarray(ys, dtype=np.float32)
-    train_end = int(len(xs) * 0.8)
-    val_end = int(len(xs) * 0.9)
-    target_min = scaler.data_min_[target_idx]
-    target_max = scaler.data_max_[target_idx]
-    y_raw = ys * (target_max - target_min) + target_min
-    return (
-        xs[:train_end],
-        ys[:train_end],
-        xs[train_end:val_end],
-        ys[train_end:val_end],
-        xs[val_end:],
-        y_raw[val_end:],
-        target_min,
-        target_max,
-    )
+    for i in range(window, len(scaled_values) - horizons + 1):
+        xs.append(scaled_values[i - window : i])
+        ys.append([scaled_values[i + h, target_idx] for h in range(horizons)])
+    return np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.float32)
+
+
+def prepare_scaled_windows(
+    train_features: pd.DataFrame,
+    val_features: pd.DataFrame,
+    test_features: pd.DataFrame,
+    config: RunConfig,
+):
+    scaler = MinMaxScaler()
+    train_scaled = scaler.fit_transform(train_features.to_numpy(float))
+    val_scaled = scaler.transform(val_features.to_numpy(float))
+    test_scaled = scaler.transform(test_features.to_numpy(float))
+    train_x, train_y = make_windows(train_scaled, config.window, config.horizons)
+    val_x, val_y = make_windows(val_scaled, config.window, config.horizons)
+    test_x, test_y = make_windows(test_scaled, config.window, config.horizons)
+    target_min = scaler.data_min_[-1]
+    target_max = scaler.data_max_[-1]
+    test_y_raw = test_y * (target_max - target_min) + target_min
+    return train_x, train_y, val_x, val_y, test_x, test_y_raw, target_min, target_max
 
 
 def metric_bundle(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    eps = 1e-8
+    denom = np.maximum(np.abs(y_true), 1e-8)
     return {
-        "rmse": float(np.sqrt(np.mean((y_true - y_pred) ** 2))),
-        "mae": float(np.mean(np.abs(y_true - y_pred))),
-        "mape": float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100.0),
+        "rmse": float(np.sqrt(np.mean((y_pred - y_true) ** 2))),
+        "mae": float(np.mean(np.abs(y_pred - y_true))),
+        "mape": float(np.mean(np.abs((y_pred - y_true) / denom)) * 100.0),
     }
 
 
-def train_and_evaluate(features: pd.DataFrame, config: RunConfig, device: torch.device) -> List[Dict[str, object]]:
-    train_x, train_y, val_x, val_y, test_x, test_y_raw, target_min, target_max = make_windows_leaky_scaled_first(features, config)
-    model = KANInformerLite(features.shape[1], config.horizons, config.d_model, config.n_heads, config.n_layers, config.kan_grid).to(device)
+def train_and_evaluate(
+    train_features: pd.DataFrame,
+    val_features: pd.DataFrame,
+    test_features: pd.DataFrame,
+    config: RunConfig,
+    device: torch.device,
+) -> List[Dict[str, object]]:
+    train_x, train_y, val_x, val_y, test_x, test_y_raw, target_min, target_max = prepare_scaled_windows(
+        train_features, val_features, test_features, config
+    )
+    print(f"    windows: train={len(train_x)}, val={len(val_x)}, test={len(test_x)}, features={train_features.shape[1]}")
+    model = PaperKANInformer(train_features.shape[1], config.horizons, config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
     train_loader = DataLoader(
@@ -342,14 +393,14 @@ def train_and_evaluate(features: pd.DataFrame, config: RunConfig, device: torch.
     )
     val_x_t = torch.from_numpy(val_x).to(device)
     val_y_t = torch.from_numpy(val_y).to(device)
-    print(f"    samples: train={len(train_x)}, val={len(val_x)}, test={len(test_x)}, features={features.shape[1]}")
     for epoch in range(1, config.epochs + 1):
         model.train()
         losses = []
-        for bx, by in train_loader:
-            bx, by = bx.to(device), by.to(device)
+        for batch_x, batch_y in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(bx), by)
+            loss = loss_fn(model(batch_x), batch_y)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
@@ -362,36 +413,94 @@ def train_and_evaluate(features: pd.DataFrame, config: RunConfig, device: torch.
     with torch.no_grad():
         pred_scaled = model(torch.from_numpy(test_x).to(device)).cpu().numpy()
     pred_raw = pred_scaled * (target_max - target_min) + target_min
-    rows = []
-    for h in range(config.horizons):
-        rows.append({"horizon": h + 1, **metric_bundle(test_y_raw[:, h], pred_raw[:, h])})
-    return rows
+    return [{"horizon": i + 1, **metric_bundle(test_y_raw[:, i], pred_raw[:, i])} for i in range(config.horizons)]
+
+
+def decompose_before_split(
+    season: str,
+    season_df: pd.DataFrame,
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    selected = PAPER_SELECTED_INPUTS[season]
+    k_modes = min(3, PAPER_VMD_K[season]) if config.smoke else PAPER_VMD_K[season]
+    ewt_modes = min(3, config.ewt_modes) if config.smoke else config.ewt_modes
+    print(f"  {season}: VMD-CA-EWT on FULL season before split [data-leakage test], K={k_modes}, EWT={ewt_modes}")
+    components, decomp_report = fit_vmd_ca_ewt(
+        season_df["WS"].to_numpy(float),
+        k_modes=k_modes,
+        ewt_modes=ewt_modes,
+        se_threshold=config.se_threshold,
+        max_iter=config.vmd_iter,
+    )
+    full_features = build_feature_frame(season_df, selected, components)
+    train_f, val_f, test_f = chronological_split(full_features)
+    return train_f, val_f, test_f, {"selected_inputs": selected, "decomposition": {"full_season": decomp_report}}
+
+
+def decompose_after_split(
+    season: str,
+    season_df: pd.DataFrame,
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    selected = PAPER_SELECTED_INPUTS[season]
+    train_df, val_df, test_df = chronological_split(season_df)
+    k_modes = min(3, PAPER_VMD_K[season]) if config.smoke else PAPER_VMD_K[season]
+    ewt_modes = min(3, config.ewt_modes) if config.smoke else config.ewt_modes
+    print(f"  {season}: VMD-CA-EWT separately AFTER split [no leakage], K={k_modes}, EWT={ewt_modes}")
+    train_components, train_report = fit_vmd_ca_ewt(
+        train_df["WS"].to_numpy(float), k_modes, ewt_modes, config.se_threshold, config.vmd_iter
+    )
+    train_high_idx = train_report["high_complexity_indices_zero_based"]
+    val_components, val_report = fit_vmd_ca_ewt(
+        val_df["WS"].to_numpy(float), k_modes, ewt_modes, config.se_threshold, config.vmd_iter, fixed_high_idx=train_high_idx
+    )
+    test_components, test_report = fit_vmd_ca_ewt(
+        test_df["WS"].to_numpy(float), k_modes, ewt_modes, config.se_threshold, config.vmd_iter, fixed_high_idx=train_high_idx
+    )
+    train_f = build_feature_frame(train_df, selected, train_components)
+    val_f = build_feature_frame(val_df, selected, val_components)
+    test_f = build_feature_frame(test_df, selected, test_components)
+    return train_f, val_f, test_f, {
+        "selected_inputs": selected,
+        "decomposition": {"train": train_report, "val": val_report, "test": test_report},
+    }
 
 
 def print_metric_table(rows: List[Dict[str, object]]) -> None:
-    print("\nPaper-style metric table")
+    print("\nPaper-format metric table")
     print("Season   H  RMSE       MAE        MAPE(%)    Paper_RMSE  Paper_MAE  Paper_MAPE")
     print("------- -- ---------- ---------- ---------- ---------- ---------- ----------")
     for row in rows:
-        p = PAPER_FINAL.get((row["season"], row["horizon"]), {})
+        paper = PAPER_FINAL[(row["season"], row["horizon"])]
         print(
             f"{row['season']:<7} h{row['horizon']} "
             f"{row['rmse']:<10.6f} {row['mae']:<10.6f} {row['mape']:<10.3f} "
-            f"{p.get('rmse', math.nan):<10.3f} {p.get('mae', math.nan):<10.3f} {p.get('mape', math.nan):<10.3f}"
+            f"{paper['rmse']:<10.3f} {paper['mae']:<10.3f} {paper['mape']:<10.3f}"
         )
 
 
 def write_outputs(rows: List[Dict[str, object]], reports: Dict[str, object], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out_dir / "metrics.csv", index=False)
-    with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump({"pipeline": "original_dataleak", "leakage": True, "reports": reports, "metrics": rows}, f, indent=2)
-    lines = ["# Original Data-Leak Pipeline Results", "", "| Season | Horizon | RMSE | MAE | MAPE | Paper RMSE | Paper MAE | Paper MAPE |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    payload = {
+        "pipeline": PIPELINE_NAME,
+        "decompose_before_split": DECOMPOSE_BEFORE_SPLIT,
+        "only_intended_difference": "VMD-CA-EWT before split vs after split",
+        "reports": reports,
+        "metrics": rows,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    lines = [
+        f"# {PIPELINE_NAME} Results",
+        "",
+        "| Season | Horizon | RMSE | MAE | MAPE | Paper RMSE | Paper MAE | Paper MAPE |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
     for row in rows:
-        p = PAPER_FINAL[(row["season"], row["horizon"])]
+        paper = PAPER_FINAL[(row["season"], row["horizon"])]
         lines.append(
             f"| {row['season']} | h{row['horizon']} | {row['rmse']:.6f} | {row['mae']:.6f} | {row['mape']:.3f}% | "
-            f"{p['rmse']:.3f} | {p['mae']:.3f} | {p['mape']:.1f}% |"
+            f"{paper['rmse']:.3f} | {paper['mae']:.3f} | {paper['mape']:.1f}% |"
         )
     (out_dir / "paper_format_results.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -399,40 +508,49 @@ def write_outputs(rows: List[Dict[str, object]], reports: Dict[str, object], out
 def run_pipeline(config: RunConfig, out_dir: Path) -> None:
     seed_everything()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Pipeline: {PIPELINE_NAME}")
+    print(f"Decomposition before split: {DECOMPOSE_BEFORE_SPLIT}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     raw = load_hourly(RAW_CSV)
-    clean, outliers = clean_full_series_leaky(raw)
-    seasons = split_seasons(clean)
-    all_rows: List[Dict[str, object]] = []
-    reports: Dict[str, object] = {"outlier_counts": outliers, "season_reports": {}}
+    cleaned, outliers = clean_like_paper(raw)
+    seasons = split_seasons(cleaned)
+    rows: List[Dict[str, object]] = []
+    reports: Dict[str, object] = {"outlier_counts_3sigma": outliers, "season_reports": {}}
     for season in SEASONS:
         season_df = seasons[season]
         if config.smoke:
             season_df = season_df.head(360).copy()
-        print(f"\nRunning {season} [original_dataleak], rows={len(season_df)}")
-        pcc = pcc_report_full_season_leaky(season_df)
-        features, feature_report = build_full_season_features_leaky(season, season_df, config)
-        metrics = train_and_evaluate(features, config, device)
-        reports["season_reports"][season] = {"pcc": pcc.to_dict(orient="records"), "features": feature_report}
+        print(f"\nRunning {season}, rows={len(season_df)}")
+        pcc = pcc_report(season_df)
+        if DECOMPOSE_BEFORE_SPLIT:
+            train_f, val_f, test_f, report = decompose_before_split(season, season_df, config)
+        else:
+            train_f, val_f, test_f, report = decompose_after_split(season, season_df, config)
+        metrics = train_and_evaluate(train_f, val_f, test_f, config, device)
+        report["pcc_full_season_report"] = pcc.to_dict(orient="records")
+        report["feature_columns"] = list(train_f.columns)
+        reports["season_reports"][season] = report
         for row in metrics:
-            all_rows.append({"pipeline": "original_dataleak", "season": season, **row})
-    print_metric_table(all_rows)
-    write_outputs(all_rows, reports, out_dir)
+            rows.append({"pipeline": PIPELINE_NAME, "season": season, **row})
+    print_metric_table(rows)
+    write_outputs(rows, reports, out_dir)
     print(f"\nWrote results to: {out_dir.resolve()}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Paper-style original data-leak VMD-CA-EWT-KANInformer pipeline.")
+    parser = argparse.ArgumentParser(description="Paper-replica KANInformer pipeline with VMD-CA-EWT before split.")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--d-model", type=int, default=96)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--n-layers", type=int, default=2)
-    parser.add_argument("--kan-grid", type=int, default=8)
+    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--e-layers", type=int, default=1)
+    parser.add_argument("--d-ff", type=int, default=2048)
+    parser.add_argument("--kan-grid", type=int, default=5)
     parser.add_argument("--vmd-iter", type=int, default=200)
     parser.add_argument("--ewt-modes", type=int, default=8)
+    parser.add_argument("--se-threshold", type=float, default=0.4)
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--skip-smoke", action="store_true")
     return parser.parse_args()
@@ -445,12 +563,14 @@ def make_config(args: argparse.Namespace, smoke: bool) -> RunConfig:
         lr=args.lr,
         d_model=16 if smoke else args.d_model,
         n_heads=2 if smoke else args.n_heads,
-        n_layers=1 if smoke else args.n_layers,
-        kan_grid=4 if smoke else args.kan_grid,
+        e_layers=1 if smoke else args.e_layers,
+        d_ff=32 if smoke else args.d_ff,
+        kan_grid=3 if smoke else args.kan_grid,
         window=7,
         horizons=3,
         vmd_iter=20 if smoke else args.vmd_iter,
         ewt_modes=args.ewt_modes,
+        se_threshold=args.se_threshold,
         smoke=smoke,
     )
 
